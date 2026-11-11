@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Work Reminder",
+    "description": "Reminds you to stop working at several times a day: pulls the DSH window to the front and shows a full-screen animated alert with dismiss and five-minute snooze. Defaults to 12:10 and 18:00."
+  }
+}
