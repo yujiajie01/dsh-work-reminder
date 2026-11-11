@@ -1,6 +1,6 @@
 {
   "name": "@local/work-reminder",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Work-time reminders for the DSH web UI: multiple daily times, a full-screen animated overlay that pulls the DSH window to the front, with dismiss and 5-minute snooze.",

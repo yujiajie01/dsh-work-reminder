@@ -13,6 +13,10 @@ window.__ModuleLoader__.load({
 
     const NS = 'work-reminder';
     const STORAGE_KEY = 'dsh.work-reminder.v1';
+    /** Where the user-picked reminder image is kept, as a data URL. */
+    const IMAGE_KEY = 'dsh.work-reminder.image.v1';
+    /** Refuse images above this size; a data URL that big already strains localStorage. */
+    const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
     const SNOOZE_MS = 5 * 60 * 1000;
     /** Default times: lunch break and end of the workday. */
     const DEFAULT_TIMES = ['12:10', '18:00'];
@@ -53,6 +57,15 @@ window.__ModuleLoader__.load({
       unmute: '开启提示音',
       everyDay: '每天',
       autoFocus: '自动聚焦窗口',
+      image: '提醒图片',
+      imageDefault: '使用默认图标',
+      imagePick: '选择图片',
+      imageHint: '支持 SVG、PNG、GIF、JPG、WebP',
+      imageTooBig: '图片过大（上限 3 MB）',
+      imageBadType: '不支持的图片格式',
+      imageFailed: '图片读取失败',
+      imagePreview: '图片预览',
+      imageRestore: '恢复默认图标',
     };
 
     const EN = {
@@ -81,6 +94,15 @@ window.__ModuleLoader__.load({
       unmute: 'Enable chime',
       everyDay: 'every day',
       autoFocus: 'Raise the window',
+      image: 'Reminder image',
+      imageDefault: 'Use the default icon',
+      imagePick: 'Choose an image',
+      imageHint: 'SVG, PNG, GIF, JPG or WebP',
+      imageTooBig: 'Image too large (3 MB limit)',
+      imageBadType: 'Unsupported image type',
+      imageFailed: 'Could not read the image',
+      imagePreview: 'Image preview',
+      imageRestore: 'Restore the default icon',
     };
 
     const CSS = [
@@ -131,6 +153,12 @@ window.__ModuleLoader__.load({
       'border:2px solid rgba(247,178,103,.55);animation:wr-pulse 2.1s ease-out infinite}',
       '.wr-ico{display:flex;justify-content:center;margin-bottom:14px;color:#f7b267}',
       '.wr-ico svg{animation:wr-swing 2.6s ease-in-out infinite;transform-origin:50% 8%}',
+      '.wr-ico img{display:block;max-width:min(200px,42vw);max-height:200px;border-radius:16px;object-fit:contain}',
+      '.wr-ico-custom{animation:wr-bob 2.8s ease-in-out infinite!important}',
+      '.wr-thumb{width:44px;height:44px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);',
+      'background:var(--dsw-alias-bg-layer-2);object-fit:contain;flex:none}',
+      '.wr-thumb-empty{display:flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-tertiary);',
+      'font-size:18px;background:var(--dsw-alias-bg-layer-2)}',
       '.wr-title{margin:0;font-size:clamp(34px,7vw,64px);font-weight:800;letter-spacing:-.02em;line-height:1.05;',
       'background:linear-gradient(96deg,#ffd9a3,#f7b267 42%,#ff8f6b);-webkit-background-clip:text;background-clip:text;',
       '-webkit-text-fill-color:transparent;animation:wr-shimmer 3.4s linear infinite;background-size:200% 100%}',
@@ -158,8 +186,9 @@ window.__ModuleLoader__.load({
       '@keyframes wr-pulse{0%{opacity:.7;transform:scale(1)}70%{opacity:0;transform:scale(1.045)}100%{opacity:0;transform:scale(1.045)}}',
       '@keyframes wr-swing{0%,100%{transform:rotate(-9deg)}50%{transform:rotate(9deg)}}',
       '@keyframes wr-shimmer{from{background-position:0% 50%}to{background-position:200% 50%}}',
+      '@keyframes wr-bob{0%,100%{transform:translateY(0) scale(1)}50%{transform:translateY(-8px) scale(1.03)}}',
       '@media (prefers-reduced-motion: reduce){',
-      '.wr-overlay,.wr-card,.wr-ico svg,.wr-title,.wr-ring{animation:none!important}}',
+      '.wr-overlay,.wr-card,.wr-ico svg,.wr-ico img,.wr-title,.wr-ring{animation:none!important}}',
     ].join('');
 
     //#region schedule helpers
@@ -258,6 +287,66 @@ window.__ModuleLoader__.load({
       } catch (error) {
         /* storage may be unavailable; the in-memory state still works */
       }
+    }
+
+    /** The user's reminder image as a data URL, or '' when the default icon is used. */
+    function readImage() {
+      try {
+        const raw = window.localStorage.getItem(IMAGE_KEY);
+        if (typeof raw !== 'string' || raw.slice(0, 5) !== 'data:') return '';
+        return raw;
+      } catch (error) {
+        return '';
+      }
+    }
+
+    /** Persist the image, or clear it when `value` is empty. */
+    function writeImage(value) {
+      try {
+        if (!value) window.localStorage.removeItem(IMAGE_KEY);
+        else window.localStorage.setItem(IMAGE_KEY, value);
+        return true;
+      } catch (error) {
+        // A quota failure must not leave the preview showing an image that
+        // will not survive a reload.
+        return false;
+      }
+    }
+
+    /** The image types a browser can render on its own. */
+    const IMAGE_TYPES = ['image/svg+xml', 'image/png', 'image/gif', 'image/jpeg', 'image/webp'];
+
+    /**
+     * Validate a picked file and read it as a data URL.
+     * Resolves { ok: true, dataUrl } or { ok: false, reason: 'type' | 'size' | 'read' }.
+     */
+    function readImageFile(file) {
+      return new Promise(function (resolve) {
+        if (!file) {
+          resolve({ ok: false, reason: 'read' });
+          return;
+        }
+        const type = String(file.type || '').toLowerCase();
+        if (IMAGE_TYPES.indexOf(type) < 0) {
+          resolve({ ok: false, reason: 'type' });
+          return;
+        }
+        if (file.size > MAX_IMAGE_BYTES) {
+          resolve({ ok: false, reason: 'size' });
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = function () {
+          const result = reader.result;
+          if (typeof result !== 'string' || result.slice(0, 5) !== 'data:') {
+            resolve({ ok: false, reason: 'read' });
+            return;
+          }
+          resolve({ ok: true, dataUrl: result });
+        };
+        reader.onerror = function () { resolve({ ok: false, reason: 'read' }); };
+        reader.readAsDataURL(file);
+      });
     }
 
     //#endregion
@@ -410,6 +499,9 @@ window.__ModuleLoader__.load({
         const [times, setTimes] = React.useState(initial.times);
         const [muted, setMuted] = React.useState(initial.muted);
         const [autoFocus, setAutoFocus] = React.useState(initial.autoFocus);
+        const [image, setImageState] = React.useState(readImage);
+        /** Last image problem, shown in the settings panel. */
+        const [imageError, setImageError] = React.useState('');
         const [now, setNow] = React.useState(function () { return Date.now(); });
         /** The reminder on screen, or null. */
         const [firing, setFiring] = React.useState(null);
@@ -459,6 +551,18 @@ window.__ModuleLoader__.load({
         React.useEffect(function () {
           writeSettings({ times: times, muted: muted, autoFocus: autoFocus });
         }, [times, muted, autoFocus]);
+
+        /** Store a new image (or clear it); keeps the old one when storage refuses. */
+        function setImage(value) {
+          const stored = writeImage(value);
+          if (!stored) {
+            setImageError('quota');
+            return false;
+          }
+          setImageState(value);
+          setImageError('');
+          return true;
+        }
 
         function raiseWindow() {
           setFocusState('pending');
@@ -526,6 +630,7 @@ window.__ModuleLoader__.load({
 
         return {
           times: times, setTimes: setTimes,
+          image: image, setImage: setImage, imageError: imageError, setImageError: setImageError,
           muted: muted, setMuted: setMuted,
           autoFocus: autoFocus, setAutoFocus: setAutoFocus,
           now: now,
@@ -540,6 +645,17 @@ window.__ModuleLoader__.load({
         const t = props.t;
         const [draft, setDraft] = React.useState(props.times.slice());
         const [error, setError] = React.useState('');
+        const pickRef = React.useRef(null);
+        const reason = props.imageError;
+        const imageNote = reason === 'size'
+          ? t('imageTooBig')
+          : reason === 'type'
+            ? t('imageBadType')
+            : reason === 'quota'
+              ? t('imageTooBig')
+              : reason === 'read'
+                ? t('imageFailed')
+                : '';
 
         function update(index, value) {
           setDraft(function (current) {
@@ -630,6 +746,49 @@ window.__ModuleLoader__.load({
               onChange: function (event) { props.onAutoFocus(event.target.checked); },
             }),
             t('autoFocus')),
+          h('div', { className: 'wr-row', style: { marginTop: '10px' } },
+            props.image
+              ? h('img', {
+                className: 'wr-thumb',
+                src: props.image,
+                alt: t('imagePreview'),
+              })
+              : h('div', { className: 'wr-thumb wr-thumb-empty', 'aria-hidden': 'true' }, '\u2699'),
+            h('button', {
+              type: 'button',
+              onClick: function () { pickRef.current && pickRef.current.click(); },
+              style: { flex: '1 1 auto' },
+            }, t('imagePick')),
+            props.image
+              ? h('button', {
+                type: 'button',
+                onClick: function () { props.onImage(''); },
+                title: t('imageRestore'),
+                'aria-label': t('imageRestore'),
+              }, '\u21ba')
+              : null),
+          h('input', {
+            ref: pickRef,
+            type: 'file',
+            accept: 'image/svg+xml,image/png,image/gif,image/jpeg,image/webp',
+            style: { display: 'none' },
+            'aria-label': t('imagePick'),
+            onChange: function (event) {
+              const file = event.target.files && event.target.files[0];
+              event.target.value = '';
+              if (!file) return;
+              readImageFile(file).then(function (result) {
+                if (!result.ok) {
+                  props.onImageError(result.reason);
+                  return;
+                }
+                props.onImage(result.dataUrl);
+              });
+            },
+          }),
+          imageNote
+            ? h('p', { className: 'wr-err', role: 'alert' }, imageNote)
+            : h('p', { className: 'wr-note' }, t('imageHint')),
           error ? h('p', { className: 'wr-err', role: 'alert' }, error) : null,
           h('p', { className: 'wr-note' }, t('hint')),
           h('div', { className: 'wr-actions' },
@@ -686,6 +845,10 @@ window.__ModuleLoader__.load({
               t: t,
               times: state.times,
               autoFocus: state.autoFocus,
+              image: state.image,
+              imageError: state.imageError,
+              onImage: function (value) { state.setImage(value); },
+              onImageError: function (reason) { state.setImageError(reason); },
               onSave: function (value) { state.setTimes(value); },
               onAutoFocus: state.setAutoFocus,
               onClose: function () { setOpen(false); },
@@ -725,7 +888,15 @@ window.__ModuleLoader__.load({
         },
           h('div', { className: 'wr-card' },
             h('div', { className: 'wr-ring' }),
-            h('div', { className: 'wr-ico' }, h(ClockIcon, { size: 58 })),
+            state.image
+              ? h('div', { className: 'wr-ico' },
+                h('img', {
+                  className: 'wr-ico-custom',
+                  src: state.image,
+                  alt: '',
+                  'aria-hidden': 'true',
+                }))
+              : h('div', { className: 'wr-ico' }, h(ClockIcon, { size: 58 })),
             h('h2', { className: 'wr-title', id: 'wr-title' }, t('dueNow')),
             h('p', { className: 'wr-sub' }, t('subtitle')),
             h('div', { className: 'wr-times' },

@@ -3,22 +3,24 @@
  *
  * The reminder itself lives in the browser half: it owns the schedule, the
  * overlay and the chime. This half exists for the one thing a web page cannot
- * do — raise the DSH window to the front, because a timer that fires inside a
+ * do - raising the DSH window to the front, because a timer that fires inside a
  * background window would otherwise stay unnoticed behind whatever the user is
  * doing.
+ *
+ * Raising a window on Windows is deliberately hard. A process that does not own
+ * the foreground is refused by SetForegroundWindow: it returns false and the
+ * foreground stays where it was. The only reliable way for a background helper
+ * to take the foreground is to attach its input queue to the current foreground
+ * thread first (AttachThreadInput), which makes the call legally "the
+ * foreground thread's own request". This module does that, then verifies the
+ * result with GetForegroundWindow instead of trusting a return value.
  *
  * Routes (same-origin, loopback-only):
  *
  *   POST /api/work-reminder/focus   - bring the DSH desktop window to the front
  *   GET  /api/work-reminder/state   - whether focusing is supported here
- *
- * Focusing is best-effort by design. A browser tab in Chrome cannot be raised
- * by the page itself, and this plugin does not pretend otherwise: the route
- * reports what it could do, and the client only claims "brought to front" when
- * the host says it succeeded.
  */
 import { execFile } from "node:child_process";
-import os from "node:os";
 
 /** Stable cordis plugin name. */
 const name = "work-reminder";
@@ -26,51 +28,81 @@ const name = "work-reminder";
 const inject = ["webServer"];
 
 /** How long the OS command may take before the answer is "could not focus". */
-const FOCUS_TIMEOUT_MS = 6000;
+const FOCUS_TIMEOUT_MS = 8000;
 
 /**
- * The window titles / processes that count as "the DSH window".
+ * Window titles that identify the DSH window.
  *
- * The desktop app's window title is the active session title, so matching on a
- * fixed title would only work for one session. Both the process name and the
- * title are matched loosely instead: the Electron app is "DeepSeek Harness",
- * and a browser tab showing the web GUI has DSH in its title.
+ * The desktop app is an Electron shell: the browser process has no window of
+ * its own, and the real window belongs to a renderer, so matching on the
+ * process name alone finds nothing. The window is located by its title instead.
  */
-const WINDOW_MATCHERS = ["DeepSeek Harness", "DeepSeek", "dsh"];
+const WINDOW_TITLES = ["DeepSeek Harness", "DeepSeek", "dsh"];
 
-/** The PowerShell that raises the matching window; prints OK / NOTFOUND. */
+/** The PowerShell that raises the DSH window and reports what it observed. */
 function focusScript() {
+  const titles = WINDOW_TITLES.map((t) => "'" + t + "'").join(",");
   return [
     "$sig = @'",
     "using System;",
+    "using System.Text;",
     "using System.Runtime.InteropServices;",
-    "public class DshWorkReminderWin {",
-    '  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);',
-    '  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);',
-    '  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);',
-    '  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);',
-    '  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);',
+    "public class DshWorkReminder {",
+    "  public delegate bool EnumProc(IntPtr h, IntPtr l);",
+    '  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);',
+    '  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
+    '  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+    '  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
+    '  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);',
+    '  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);',
+    '  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);',
+    '  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);',
+    '  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);',
+    '  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();',
+    '  [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);',
+    '  [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int max);',
+    "  public static string Title(IntPtr h) { var sb = new StringBuilder(512); GetWindowText(h, sb, 512); return sb.ToString(); }",
+    "  public static IntPtr FindByTitle(string[] needles) {",
+    "    IntPtr found = IntPtr.Zero;",
+    "    EnumWindows((h, l) => {",
+    "      if (!IsWindowVisible(h)) return true;",
+    "      string title = Title(h);",
+    "      if (title.Length == 0) return true;",
+    "      foreach (var n in needles) {",
+    "        if (title.IndexOf(n, StringComparison.OrdinalIgnoreCase) >= 0) { found = h; return false; }",
+    "      }",
+    "      return true;",
+    "    }, IntPtr.Zero);",
+    "    return found;",
+    "  }",
     "}",
     "'@",
     "Add-Type -TypeDefinition $sig",
-    "$patterns = @(" + WINDOW_MATCHERS.map((m) => "'" + m + "'").join(",") + ")",
-    "$target = $null",
-    "foreach ($proc in Get-Process) {",
-    "  if ($proc.MainWindowHandle -eq 0) { continue }",
-    "  $title = $proc.MainWindowTitle",
-    "  $hit = $false",
-    "  foreach ($p in $patterns) {",
-    "    if ($proc.ProcessName -like ('*' + $p + '*')) { $hit = $true }",
-    "    if ($title -and $title -like ('*' + $p + '*')) { $hit = $true }",
-    "  }",
-    "  if ($hit) { $target = $proc; break }",
-    "}",
-    'if ($null -eq $target) { Write-Output "NOTFOUND"; exit 0 }',
-    "$h = $target.MainWindowHandle",
-    "if ([DshWorkReminderWin]::IsIconic($h)) { [DshWorkReminderWin]::ShowWindow($h, 9) | Out-Null }",
-    "$ok = [DshWorkReminderWin]::SetForegroundWindow($h)",
-    "[DshWorkReminderWin]::BringWindowToTop($h) | Out-Null",
-    'Write-Output ("OK " + $target.ProcessName)',
+    "$needles = @(" + titles + ")",
+    "$target = [DshWorkReminder]::FindByTitle($needles)",
+    'if ($target -eq [IntPtr]::Zero) { Write-Output "NOTFOUND"; exit 0 }',
+    // Restore first: a minimized window can still be reported as the foreground
+    // one, so checking the foreground before this would skip the restore.
+    "if ([DshWorkReminder]::IsIconic($target)) { [DshWorkReminder]::ShowWindow($target, 9) | Out-Null; Start-Sleep -Milliseconds 350 }",
+    "$before = [DshWorkReminder]::GetForegroundWindow()",
+    'if ($before -eq $target) { Write-Output ("OK already " + [DshWorkReminder]::Title($target)); exit 0 }',
+    // Attach to the current foreground thread so the call is not refused.
+    "$fgThread = [DshWorkReminder]::GetWindowThreadProcessId($before, [ref]$null)",
+    "$targetThread = [DshWorkReminder]::GetWindowThreadProcessId($target, [ref]$null)",
+    "$curThread = [DshWorkReminder]::GetCurrentThreadId()",
+    "$attachedFg = $false",
+    "$attachedTarget = $false",
+    "if ($fgThread -ne 0 -and $fgThread -ne $curThread) { $attachedFg = [DshWorkReminder]::AttachThreadInput($curThread, $fgThread, $true) }",
+    "if ($targetThread -ne 0 -and $targetThread -ne $curThread) { $attachedTarget = [DshWorkReminder]::AttachThreadInput($curThread, $targetThread, $true) }",
+    "[DshWorkReminder]::BringWindowToTop($target) | Out-Null",
+    "$raised = [DshWorkReminder]::SetForegroundWindow($target)",
+    "if ($attachedFg) { [DshWorkReminder]::AttachThreadInput($curThread, $fgThread, $false) | Out-Null }",
+    "if ($attachedTarget) { [DshWorkReminder]::AttachThreadInput($curThread, $targetThread, $false) | Out-Null }",
+    "Start-Sleep -Milliseconds 300",
+    // Trust what the system reports, not what the call returned.
+    "$after = [DshWorkReminder]::GetForegroundWindow()",
+    'if ($after -eq $target) { Write-Output ("OK " + [DshWorkReminder]::Title($target)) }',
+    'else { Write-Output ("FAIL raised=" + $raised + " before=" + [DshWorkReminder]::Title($before) + " after=" + [DshWorkReminder]::Title($after)) }',
   ].join("\n");
 }
 
@@ -93,8 +125,10 @@ function focusWindow() {
         const text = String(stdout ?? "").trim();
         if (text.startsWith("OK")) {
           resolve({ focused: true, detail: text });
+        } else if (text === "NOTFOUND") {
+          resolve({ focused: false, detail: "no DSH window found" });
         } else {
-          resolve({ focused: false, detail: "no matching DSH window" });
+          resolve({ focused: false, detail: text || "focus did not take effect" });
         }
       }
     );
@@ -106,7 +140,6 @@ function isLoopback(req) {
   const address = req.socket?.remoteAddress ?? "";
   const normalized = address.startsWith("::ffff:") ? address.slice(7) : address;
   if (normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost") return true;
-  // Any other loopback address in 127.0.0.0/8.
   return /^127\./.test(normalized);
 }
 
@@ -124,7 +157,7 @@ function isTrustedRequest(req) {
     return false;
   }
   const hostname = hostUrl.hostname;
-  if (!(hostname === "localhost" || hostname === "::1" || /^127\./.test(hostname) || hostname === "[::1]")) return false;
+  if (!(hostname === "localhost" || hostname === "::1" || hostname === "[::1]" || /^127\./.test(hostname))) return false;
   if (req.headers["sec-fetch-site"] === "cross-site") return false;
   const origin = req.headers.origin;
   if (origin === undefined) return true;
